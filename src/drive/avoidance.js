@@ -79,6 +79,20 @@ export function avoidanceFromWhiskers(whiskers) {
   const center = whiskers[0];
   if (center && center.hit && Math.abs(steerBias) < 0.15) steerBias = -0.8;
 
+  // Traffic spacing: detect leading dynamic vehicle ahead (center-ish whiskers)
+  let lead = null;
+  for (let i = 0; i < Math.min(3, whiskers.length); i++) {
+    const w = whiskers[i];
+    if (w && w.hit && w.hitDynamic && w.obstacle) {
+      const o = w.obstacle;
+      if (!lead || w.t < lead.dist) {
+        const ovx = o.vx || 0, ovz = o.vz || 0;
+        // speed of lead along its forward (approx via velocity magnitude toward/away isn't perfect, but ok)
+        lead = { dist: w.t, vx: ovx, vz: ovz, speed: Math.hypot(ovx, ovz), id: o.id };
+      }
+    }
+  }
+
   // Speed planning from clearance: smoother, more anticipatory
   let throttleScale = 1;
   if (urgency > 0.9 || (center && center.hit && center.t < center.maxT * 0.25)) throttleScale = 0.1;
@@ -87,13 +101,21 @@ export function avoidanceFromWhiskers(whiskers) {
   else if (urgency > 0.25) throttleScale = 0.75;
   else if (urgency > 0.12) throttleScale = 0.9;
 
-  // if path ahead is very clear, allow full throttle (caller can still cap)
-  const clearAhead = !center?.hit && minT > 4.5;
+  // if following a lead car, target a time gap (slow down / match speed)
+  if (lead) {
+    const desiredGap = 2.8; // units
+    if (lead.dist < desiredGap) throttleScale = Math.min(throttleScale, 0.08);
+    else if (lead.dist < desiredGap * 1.6) throttleScale = Math.min(throttleScale, 0.35);
+    else if (lead.dist < desiredGap * 2.4) throttleScale = Math.min(throttleScale, 0.6);
+  }
+
+  const clearAhead = !center?.hit && minT > 4.5 && !lead;
   return {
     steer: Math.max(-1, Math.min(1, steerBias)),
     throttleScale,
     urgency: Math.min(1, urgency),
     minClearance: Number.isFinite(minT) ? minT : Infinity,
     clearAhead,
+    lead,
   };
 }
