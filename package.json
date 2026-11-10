@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "oxlint",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node test/fidelity.mjs && node test/physics.mjs",
+    "test:app": "node test/app-probe.mjs"
   },
   "dependencies": {
     "@react-three/drei": "^10.7.9",

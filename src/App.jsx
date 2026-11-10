@@ -4,6 +4,7 @@ import { OrbitControls, Grid, Environment } from "@react-three/drei";
 import Car from "./Car";
 import DriveDebug from "./debug/DriveDebug";
 import { createKeyboardController, createWaypointAgent, createRemoteAgentBridge } from "./drive/controllers";
+import { createFleet } from "./drive/fleet";
 import { initPhysics, stepPhysics, createGround, createObstacleBody } from "./physics/joltWorld";
 
 const STATIC_OBSTACLES = [
@@ -23,8 +24,17 @@ function ObstacleMeshes({ obstacles }) {
   ));
 }
 
-function PhysicsStep({ api }) {
-  useFrame((_, dt) => { if (api) stepPhysics(api, dt); });
+// Drives the whole simulation for one frame: every car applies its forces,
+// then the world is stepped, then every car reads its new transform back.
+// Doing this in one place keeps the ordering deterministic -- with rigid
+// bodies, "apply force" and "read transform" must not interleave.
+//
+// It runs inside R3F's frame loop so it stays in step with rendering and with
+// OrbitControls, which updates the camera at priority -1 (i.e. before us).
+function Simulation({ api, fleet }) {
+  useFrame((_, dt) => {
+    if (api && fleet) fleet.step(dt, api);
+  });
   return null;
 }
 
@@ -38,6 +48,7 @@ export default function App() {
 
   const keyboard = useMemo(() => createKeyboardController(window), []);
   const remote = useMemo(() => createRemoteAgentBridge(), []);
+  const fleet = useMemo(() => createFleet(), []);
 
   const npcDefs = useMemo(() => ([
     { id: "npc-1", color: "#ea580c", cabin: "#fdba74", initial: { x: 0, z: -4, heading: Math.PI }, wp: [[8,-12],[8,-32],[-8,-32],[-8,-12],[0,-4]] },
@@ -76,6 +87,28 @@ export default function App() {
   useEffect(() => { if (mode === "remote") remote.connect(); else remote.disconnect(); }, [mode, remote]);
   useEffect(() => () => { keyboard.dispose(); remote.dispose(); }, [keyboard, remote]);
 
+  // Dev-only handle so the sandbox can be inspected from the console or from
+  // the headless test harness (see test/app-probe.mjs).
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    window.__ndoto = {
+      agents,
+      fleet,
+      physics,
+      mode,
+      // Advance the simulation without waiting for frames. Used by the test
+      // harness, where the software renderer is far slower than real time.
+      advance: (seconds, dt = 1 / 60) => {
+        const api = physics.api;
+        if (!api) return 0;
+        const steps = Math.round(seconds / dt);
+        for (let i = 0; i < steps; i++) fleet.step(dt, api);
+        return steps;
+      },
+    };
+    return () => { delete window.__ndoto; };
+  }, [agents, fleet, physics, mode]);
+
   const reportPose = (id, pose) => { vehiclesRef.current[id] = pose; };
   const getObstaclesFor = (id) => {
     const dyn = [];
@@ -94,7 +127,7 @@ export default function App() {
   return (
     <>
       <div className="hud">
-        <div><strong>ndoto</strong> — vehicles + Jolt colliders (static) · curved intent debug</div>
+        <div><strong>ndoto</strong> — Jolt rigid-body vehicles · curved intent debug</div>
         <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap", pointerEvents: "auto" }}>
           {[["human","Human (WASD)"],["ai","AI driver"],["remote","Remote agent (WS)"]].map(([m,label]) => (
             <button key={m} type="button" onClick={() => setMode(m)} style={{ cursor: "pointer", borderRadius: 6, border: "1px solid rgba(148,163,184,.35)", padding: "4px 8px", fontSize: 12, color: mode===m?"#0b1020":"#e5e7eb", background: mode===m?"#93c5fd":"rgba(15,23,42,.5)" }}>{label}</button>
@@ -110,10 +143,11 @@ export default function App() {
         <color attach="background" args={["#0b1020"]} />
         <ambientLight intensity={0.55} />
         <directionalLight position={[6, 10, 6]} intensity={1.5} castShadow shadow-mapSize={[1024, 1024]} shadow-camera-far={60} shadow-camera-left={-20} shadow-camera-right={20} shadow-camera-top={20} shadow-camera-bottom={-20} />
-        <PhysicsStep api={physics.api} />
 
-        <Car id="player" driver={playerDriver} remoteBridge={remote} obstacles={getObstaclesFor} reportPose={reportPose} followCamera initial={{ x: 0, z: 0, heading: Math.PI }} color="#2563eb" cabinColor="#60a5fa" />
-        {npcDefs.map((d) => <Car key={d.id} id={d.id} driver={agents.npcs[d.id]} obstacles={getObstaclesFor} reportPose={reportPose} initial={d.initial} color={d.color} cabinColor={d.cabin} />)}
+        <Simulation api={physics.api} fleet={fleet} />
+
+        <Car id="player" driver={playerDriver} remoteBridge={remote} obstacles={getObstaclesFor} reportPose={reportPose} initial={{ x: 0, z: 0, heading: Math.PI }} color="#2563eb" cabinColor="#60a5fa" api={physics.api} fleet={fleet} followCamera />
+        {npcDefs.map((d) => <Car key={d.id} id={d.id} driver={agents.npcs[d.id]} obstacles={getObstaclesFor} reportPose={reportPose} initial={d.initial} color={d.color} cabinColor={d.cabin} api={physics.api} fleet={fleet} />)}
         <ObstacleMeshes obstacles={STATIC_OBSTACLES} />
         <DriveDebug drivers={debugDrivers} obstacles={STATIC_OBSTACLES} />
 
