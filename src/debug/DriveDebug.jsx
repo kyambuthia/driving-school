@@ -55,18 +55,22 @@ export default function DriveDebug({ drivers = [], obstacles = [] }) {
           pts.push([dbg.waypoints[0][0], y, dbg.waypoints[0][1]]);
           items.push(<Line key={`${d.id}-wp`} points={pts} color={color} lineWidth={1} transparent opacity={0.35} dashed dashSize={0.4} gapSize={0.25} />);
         }
+        if (Array.isArray(dbg.plan) && dbg.plan.length > 1 && dbg.obs) {
+          const pts = [[dbg.obs.x, y + 0.02, dbg.obs.z], ...dbg.plan.map((p) => [p.x, y + 0.02, p.z])];
+          items.push(<Line key={`${d.id}-plan`} points={pts} color="#22d3ee" lineWidth={2} transparent opacity={0.8} />);
+        }
         if (dbg.target) {
-          items.push(<Marker key={`${d.id}-tgt`} position={[dbg.target.x, 0.35, dbg.target.z]} color="#22c55e" size={0.3} />);
+          const tcolor = dbg.recovering ? "#f59e0b" : "#22c55e";
+          items.push(<Marker key={`${d.id}-tgt`} position={[dbg.target.x, 0.35, dbg.target.z]} color={tcolor} size={0.3} />);
         }
         if (dbg.obs) {
-          // Predicted trajectory arc (curved intent based on current heading/steer/speed)
           const steer = dbg.intent?.steer ?? 0;
           const speed = dbg.obs.speed ?? 0;
           const arc = predictArc({ x: dbg.obs.x, z: dbg.obs.z, heading: dbg.obs.heading, speed, steer: steer * 0.5 });
-          items.push(<Line key={`${d.id}-arc`} points={arc} color="#22c55e" lineWidth={2.5} transparent opacity={0.85} />);
-          // faint direct line to target for reference
+          const acolor = dbg.recovering ? "#f59e0b" : "#22c55e";
+          items.push(<Line key={`${d.id}-arc`} points={arc} color={acolor} lineWidth={2.5} transparent opacity={0.85} />);
           if (dbg.target) {
-            items.push(<Line key={`${d.id}-intend`} points={[[dbg.obs.x, y, dbg.obs.z], [dbg.target.x, y, dbg.target.z]]} color="#22c55e" lineWidth={1} transparent opacity={0.2} dashed dashSize={0.2} gapSize={0.15} />);
+            items.push(<Line key={`${d.id}-intend`} points={[[dbg.obs.x, y, dbg.obs.z], [dbg.target.x, y, dbg.target.z]]} color={acolor} lineWidth={1} transparent opacity={0.2} dashed dashSize={0.2} gapSize={0.15} />);
           }
         }
         if (Array.isArray(dbg.whiskers) && dbg.obs) {
