@@ -173,8 +173,8 @@ export function createRemoteAgentBridge({ url } = {}) {
           lastIntent = clampIntent(msg);
           debug.controlMode = controlMode; debug.lastIntent = lastIntent;
         } else if (msg.type === "goal") {
-          if (msg.stop || (msg.x == null && msg.z == null)) goal = null;
-          else goal = { x: Number(msg.x) || 0, z: Number(msg.z) || 0, arrive: Math.max(0.5, Number(msg.arrive) || 1.8) };
+          if (msg.stop || (msg.x == null && msg.z == null)) { goal = null; resetGoalState(); }
+          else { goal = { x: Number(msg.x) || 0, z: Number(msg.z) || 0, arrive: Math.max(0.5, Number(msg.arrive) || 1.8) }; resetGoalState(); }
           controlMode = "goal";
           debug.controlMode = controlMode; debug.goal = goal; debug.target = goal ? { x: goal.x, z: goal.z } : null;
         } else if (msg.type === "mode") {
@@ -184,26 +184,40 @@ export function createRemoteAgentBridge({ url } = {}) {
     });
   };
 
+  let gLastX = null, gLastZ = null, gProgressT = 0, gStuckT = 0, gRecoverT = 0, gRecoverSteer = 1, gPlan = null, gPlanIdx = 0, gReplanCooldown = 0;
+  function resetGoalState() { gLastX = gLastZ = null; gProgressT = 0; gStuckT = 0; gRecoverT = 0; gPlan = null; gPlanIdx = 0; gReplanCooldown = 0; }
+
   function goalIntent(obs, ctx) {
+    const dtObs = Math.min(ctx?.dt || 1 / 60, 0.05);
+    gReplanCooldown = Math.max(0, gReplanCooldown - dtObs);
     if (!goal) {
+      resetGoalState();
       const intent = clampIntent({ throttle: 0, steer: 0, brake: 1 });
       Object.assign(debug, { intent, whiskers: [], avoid: null, target: null, obs: { x: obs.x, z: obs.z, heading: obs.heading, speed: obs.speed } });
       return intent;
     }
-    const dx = goal.x - obs.x, dz = goal.z - obs.z;
-    const dist = Math.hypot(dx, dz);
+    const gx = goal.x, gz = goal.z;
+    const dist = Math.hypot(gx - obs.x, gz - obs.z);
     if (dist < goal.arrive) {
+      resetGoalState();
       const intent = clampIntent({ throttle: 0, steer: 0, brake: 1 });
       send({ type: "goal_reached", goal, x: obs.x, z: obs.z });
-      Object.assign(debug, { intent, whiskers: [], avoid: null, target: { x: goal.x, z: goal.z, dist: +dist.toFixed(2), reached: true }, obs: { x: obs.x, z: obs.z, heading: obs.heading, speed: obs.speed } });
+      Object.assign(debug, { intent, whiskers: [], avoid: null, target: { x: gx, z: gz, dist: +dist.toFixed(2), reached: true }, obs: { x: obs.x, z: obs.z, heading: obs.heading, speed: obs.speed } });
       return intent;
     }
-    const targetAngle = Math.atan2(dx, dz);
-    const err = normAngle(targetAngle - obs.heading);
-    const seekSteer = Math.max(-1, Math.min(1, err * 1.5));
     const obstacles = (ctx && Array.isArray(ctx.obstacles)) ? ctx.obstacles : [];
+    const staticObstacles = obstacles.filter((o) => !o.dynamic);
     const whiskers = senseWhiskers({ x: obs.x, z: obs.z, heading: obs.heading, speed: obs.speed || 0, obstacles, carRadius: 0.95 });
     const avoid = avoidanceFromWhiskers(whiskers);
+    let aim = { x: gx, z: gz };
+    if (gPlan && gPlanIdx < gPlan.length) {
+      const pp = gPlan[gPlanIdx];
+      if (Math.hypot(pp.x - obs.x, pp.z - obs.z) < 1.8) gPlanIdx++;
+      if (gPlanIdx >= gPlan.length) gPlan = null; else aim = gPlan[gPlanIdx];
+    }
+    const ax = aim.x - obs.x, az = aim.z - obs.z;
+    const err = normAngle(Math.atan2(ax, az) - obs.heading);
+    const seekSteer = Math.max(-1, Math.min(1, err * 1.5));
     const curvatureSlow = Math.max(0.3, 1 - Math.abs(seekSteer) * 0.5);
     const clearanceSlow = avoid.clearAhead ? 1 : Math.max(0.2, 0.45 + (1 - avoid.urgency) * 0.55);
     let seekThrottle = dist < goal.arrive * 2 ? 0.25 : 0.9 * curvatureSlow * clearanceSlow;
@@ -214,11 +228,21 @@ export function createRemoteAgentBridge({ url } = {}) {
       throttle = Math.min(throttle, seekThrottle * avoid.throttleScale);
       if (avoid.urgency > 0.9 && avoid.minClearance < 1.2) throttle = Math.min(throttle, -0.2);
     }
-    if (Math.abs(obs.speed) < 0.1 && avoid.urgency > 0.4 && dist > goal.arrive) {
-      throttle = -0.7; steer = avoid.steer !== 0 ? avoid.steer : (err >= 0 ? -1 : 1);
+    const moved = gLastX == null ? 1 : Math.hypot(obs.x - gLastX, obs.z - gLastZ);
+    gLastX = obs.x; gLastZ = obs.z;
+    if (moved > 0.003) gProgressT = 0; else gProgressT += dtObs;
+    const blocked = avoid.urgency > 0.35 || Math.abs(obs.speed) < 0.35;
+    if (seekThrottle > 0.15 && blocked && (gProgressT > 0.55 || Math.abs(obs.speed) < 0.12)) gStuckT += dtObs;
+    else gStuckT = Math.max(0, gStuckT - dtObs * 2);
+    if ((gStuckT > 0.45 || (gProgressT > 0.8 && blocked)) && gReplanCooldown <= 0) {
+      const pth = astar({ start: { x: obs.x, z: obs.z }, goal: { x: gx, z: gz }, obstacles: staticObstacles, bounds: { minX: -40, maxX: 40, minZ: -50, maxZ: 10 }, cellSize: 1.2, margin: 1.5 });
+      if (pth && pth.length > 1) { gPlan = pth; gPlanIdx = 0; gReplanCooldown = 2.5; } else gReplanCooldown = 1.0;
     }
+    if (gRecoverT <= 0 && gStuckT > 0.7) { gRecoverT = 0.95 + Math.random() * 0.55; gRecoverSteer = avoid.steer !== 0 ? Math.sign(avoid.steer) : (err >= 0 ? -1 : 1); gStuckT = 0; }
+    let recovering = false;
+    if (gRecoverT > 0) { gRecoverT -= dtObs; recovering = true; throttle = -0.85; steer = gRecoverSteer * 0.95; }
     const intent = clampIntent({ throttle, steer, brake: 0 });
-    Object.assign(debug, { intent, whiskers, avoid, target: { x: goal.x, z: goal.z, dist: +dist.toFixed(2) }, aim: { x: goal.x, z: goal.z }, obs: { x: obs.x, z: obs.z, heading: obs.heading, speed: obs.speed }, seek: { steer: +seekSteer.toFixed(2), err: +err.toFixed(2) } });
+    Object.assign(debug, { intent, whiskers, avoid, target: { x: gx, z: gz, dist: +dist.toFixed(2) }, aim, plan: gPlan ? gPlan.slice(gPlanIdx) : null, obs: { x: obs.x, z: obs.z, heading: obs.heading, speed: obs.speed }, seek: { steer: +seekSteer.toFixed(2), err: +err.toFixed(2) }, recovering });
     return intent;
   }
 
