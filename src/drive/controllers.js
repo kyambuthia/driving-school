@@ -141,34 +141,96 @@ export function createWaypointAgent({
 }
 
 // Browser side of the remote-agent WebSocket bridge.
+// Supports direct intents and high-level goals (goal -> local seek+avoidance controller).
 export function createRemoteAgentBridge({ url } = {}) {
   let ws = null;
   let status = "disconnected";
+  let controlMode = "intent"; // "intent" | "goal"
   let lastIntent = clampIntent({ throttle: 0, steer: 0 });
+  let goal = null; // {x,z,arrive}
   let listeners = new Set();
-  const debug = { type: "remote", lastIntent };
+  const debug = { type: "remote", controlMode, lastIntent, goal: null, intent: lastIntent, whiskers: [], avoid: null, target: null };
+
   const notify = () => listeners.forEach((fn) => fn(status));
+  const send = (obj) => { if (ws?.readyState === 1) ws.send(JSON.stringify(obj)); };
+
   const connect = () => {
     if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     ws = new WebSocket(url || `${proto}//${location.host}/__ndoto_agent`);
     status = "connecting"; notify();
-    ws.addEventListener("open", () => { status = "connected"; notify(); });
+    ws.addEventListener("open", () => { status = "connected"; notify(); send({ type: "hello", from: "browser" }); });
     ws.addEventListener("close", () => { status = "disconnected"; notify(); });
     ws.addEventListener("error", () => { status = "error"; notify(); });
     ws.addEventListener("message", (e) => {
       try {
         const msg = JSON.parse(e.data);
-        if (msg.type === "intent") { lastIntent = clampIntent(msg); debug.lastIntent = lastIntent; }
+        if (msg.type === "intent") {
+          controlMode = "intent";
+          lastIntent = clampIntent(msg);
+          debug.controlMode = controlMode; debug.lastIntent = lastIntent;
+        } else if (msg.type === "goal") {
+          if (msg.stop || (msg.x == null && msg.z == null)) goal = null;
+          else goal = { x: Number(msg.x) || 0, z: Number(msg.z) || 0, arrive: Math.max(0.5, Number(msg.arrive) || 1.8) };
+          controlMode = "goal";
+          debug.controlMode = controlMode; debug.goal = goal; debug.target = goal ? { x: goal.x, z: goal.z } : null;
+        } else if (msg.type === "mode") {
+          if (msg.mode === "intent" || msg.mode === "goal") { controlMode = msg.mode; debug.controlMode = controlMode; }
+        }
       } catch {}
     });
   };
+
+  function goalIntent(obs, ctx) {
+    if (!goal) {
+      const intent = clampIntent({ throttle: 0, steer: 0, brake: 1 });
+      Object.assign(debug, { intent, whiskers: [], avoid: null, target: null, obs: { x: obs.x, z: obs.z, heading: obs.heading, speed: obs.speed } });
+      return intent;
+    }
+    const dx = goal.x - obs.x, dz = goal.z - obs.z;
+    const dist = Math.hypot(dx, dz);
+    if (dist < goal.arrive) {
+      const intent = clampIntent({ throttle: 0, steer: 0, brake: 1 });
+      send({ type: "goal_reached", goal, x: obs.x, z: obs.z });
+      Object.assign(debug, { intent, whiskers: [], avoid: null, target: { x: goal.x, z: goal.z, dist: +dist.toFixed(2), reached: true }, obs: { x: obs.x, z: obs.z, heading: obs.heading, speed: obs.speed } });
+      return intent;
+    }
+    const targetAngle = Math.atan2(dx, dz);
+    const err = normAngle(targetAngle - obs.heading);
+    const seekSteer = Math.max(-1, Math.min(1, err * 1.5));
+    const obstacles = (ctx && Array.isArray(ctx.obstacles)) ? ctx.obstacles : [];
+    const whiskers = senseWhiskers({ x: obs.x, z: obs.z, heading: obs.heading, speed: obs.speed || 0, obstacles, carRadius: 0.95 });
+    const avoid = avoidanceFromWhiskers(whiskers);
+    const curvatureSlow = Math.max(0.3, 1 - Math.abs(seekSteer) * 0.5);
+    const clearanceSlow = avoid.clearAhead ? 1 : Math.max(0.2, 0.45 + (1 - avoid.urgency) * 0.55);
+    let seekThrottle = dist < goal.arrive * 2 ? 0.25 : 0.9 * curvatureSlow * clearanceSlow;
+    let steer = seekSteer, throttle = seekThrottle;
+    if (avoid.urgency > 0.06) {
+      const w = Math.min(1, avoid.urgency * 1.25);
+      steer = seekSteer * (1 - w) + avoid.steer * w;
+      throttle = Math.min(throttle, seekThrottle * avoid.throttleScale);
+      if (avoid.urgency > 0.9 && avoid.minClearance < 1.2) throttle = Math.min(throttle, -0.2);
+    }
+    if (Math.abs(obs.speed) < 0.1 && avoid.urgency > 0.4 && dist > goal.arrive) {
+      throttle = -0.7; steer = avoid.steer !== 0 ? avoid.steer : (err >= 0 ? -1 : 1);
+    }
+    const intent = clampIntent({ throttle, steer, brake: 0 });
+    Object.assign(debug, { intent, whiskers, avoid, target: { x: goal.x, z: goal.z, dist: +dist.toFixed(2) }, aim: { x: goal.x, z: goal.z }, obs: { x: obs.x, z: obs.z, heading: obs.heading, speed: obs.speed }, seek: { steer: +seekSteer.toFixed(2), err: +err.toFixed(2) } });
+    return intent;
+  }
+
   return {
     id: "remote-agent", kind: "remote", debug,
     connect, disconnect() { try { ws?.close(); } catch {} },
-    sendObs(obs) { if (ws?.readyState === 1) ws.send(JSON.stringify(obs)); },
-    getIntent() { return lastIntent; },
+    sendObs(obs) { send(obs); },
+    getIntent(obs, ctx) {
+      if (controlMode === "goal") return goalIntent(obs || {}, ctx || {});
+      debug.intent = lastIntent; debug.whiskers = []; debug.avoid = null; debug.target = null;
+      return lastIntent;
+    },
     getStatus() { return status; },
+    getMode() { return controlMode; },
+    getGoal() { return goal; },
     subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
     dispose() { listeners.clear(); this.disconnect(); },
   };
