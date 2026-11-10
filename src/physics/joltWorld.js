@@ -98,29 +98,43 @@ export function createCarBody(api, { x = 0, z = 0, heading = Math.PI, w = 1.1, h
   return body;
 }
 
+export function quatToYaw(qx, qy, qz, qw) {
+  // yaw (Y) from quaternion
+  const siny = 2 * (qw * qy + qx * qz);
+  const cosy = 1 - 2 * (qy * qy + qz * qz);
+  return Math.atan2(siny, cosy);
+}
+
 export function readBodyTransform(api, body) {
   const { bodyInterface } = api;
   const p = bodyInterface.GetPosition(body.GetID());
   const q = bodyInterface.GetRotation(body.GetID());
-  return { x: p.GetX(), y: p.GetY(), z: p.GetZ(), qx: q.GetX(), qy: q.GetY(), qz: q.GetZ(), qw: q.GetW() };
+  const qx = q.GetX(), qy = q.GetY(), qz = q.GetZ(), qw = q.GetW();
+  return { x: p.GetX(), y: p.GetY(), z: p.GetZ(), qx, qy, qz, qw, heading: quatToYaw(qx, qy, qz, qw) };
 }
 
 // Drive a dynamic body with arcade intent while letting Jolt handle collisions.
-export function driveCarBody(api, body, { heading, speed, steer, maxSteer = 0.5 }, dt) {
+// Sets desired horizontal velocity and yaw angular velocity; Jolt integrates & resolves collisions.
+export function driveCarBody(api, body, { heading, speed, steer }, dt) {
   const { Jolt, bodyInterface } = api;
   const id = body.GetID();
   const maxSpeed = 7;
   const turnFactor = 1.8;
-  let h = heading;
-  if (Math.abs(speed) > 0.02) h += (speed / maxSpeed) * steer * turnFactor * dt;
+  // desired yaw rate from steering (rad/s)
+  const yawRate = Math.abs(speed) > 0.02 ? (speed / maxSpeed) * steer * turnFactor : 0;
+  const h = heading + yawRate * dt;
   const vx = Math.sin(h) * speed;
   const vz = Math.cos(h) * speed;
   const cur = bodyInterface.GetLinearVelocity(id);
-  bodyInterface.SetLinearAndAngularVelocity(id, new Jolt.Vec3(vx, cur.GetY(), vz), new Jolt.Vec3(0, 0, 0));
-  let q;
-  if (typeof Jolt.Quat.sRotation === "function") q = Jolt.Quat.sRotation(new Jolt.Vec3(0,1,0), h);
-  else { q = new Jolt.Quat(0,0,0,1); if (typeof q.sRotation === "function") q.sRotation(new Jolt.Vec3(0,1,0), h); }
+  bodyInterface.SetLinearAndAngularVelocity(id, new Jolt.Vec3(vx, cur.GetY(), vz), new Jolt.Vec3(0, yawRate, 0));
+  bodyInterface.ActivateBody(id);
+  return { heading: h, yawRate };
+}
 
-  bodyInterface.SetRotation(id, q, Jolt.EActivation_Activate);
-  return { heading: h };
+export function removeBody(api, body) {
+  if (!api || !body) return;
+  const { bodyInterface } = api;
+  const id = body.GetID();
+  bodyInterface.RemoveBody(id);
+  bodyInterface.DestroyBody(id);
 }
