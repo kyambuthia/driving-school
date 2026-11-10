@@ -33,21 +33,39 @@ function normAngle(err) {
   return err;
 }
 
-// Tier-A AI: waypoint seeking + local whisker obstacle avoidance + stuck recovery (reverse).
+// Tier-A AI: waypoint seeking (with path lookahead) + predictive obstacle avoidance
+// (including moving cars) + speed planning + stuck recovery (reverse).
 export function createWaypointAgent({
   waypoints = [],
   loop = true,
   arrive = 1.6,
-  id = "ai-waypoint",
+  id = ai-waypoint,
   getObstacles = null,
 } = {}) {
   let idx = 0;
   let lastX = null, lastZ = null, progressT = 0, stuckT = 0, recoverT = 0, recoverSteer = 1;
-  const debug = { type: "ai-waypoint", id, idx: 0, target: null, whiskers: [], avoid: null, intent: null, recovering: false };
+  const debug = { type: ai-waypoint, id, idx: 0, target: null, aim: null, whiskers: [], avoid: null, intent: null, recovering: false };
+
+  function lookaheadPoint(ox, oz, fromIdx) {
+    // Aim at a point ~L units ahead along the waypoint polyline for smoother tracking.
+    const L = 4.5;
+    let i = fromIdx, rem = L, ax = ox, az = oz, guard = 0;
+    while (rem > 0 && guard++ < 20) {
+      const [wx, wz] = waypoints[i];
+      const dx = wx - ax, dz = wz - az, d = Math.hypot(dx, dz) || 1e-6;
+      if (d >= rem) return { x: ax + (dx / d) * rem, z: az + (dz / d) * rem, idx: i };
+      rem -= d; ax = wx; az = wz;
+      const ni = loop ? (i + 1) % waypoints.length : Math.min(i + 1, waypoints.length - 1);
+      if (ni === i) return { x: wx, z: wz, idx: i };
+      i = ni;
+    }
+    const [wx, wz] = waypoints[i];
+    return { x: wx, z: wz, idx: i };
+  }
 
   return {
     id,
-    kind: "ai",
+    kind: ai,
     debug,
     getIntent(obs, ctx) {
       const dtObs = Math.min(ctx?.dt || 1 / 60, 0.05);
@@ -61,28 +79,37 @@ export function createWaypointAgent({
       if (dist < arrive) {
         idx = loop ? (idx + 1) % waypoints.length : Math.min(idx + 1, waypoints.length - 1);
         [tx, tz] = waypoints[idx]; dx = tx - obs.x; dz = tz - obs.z; dist = Math.hypot(dx, dz);
-        stuckT = 0; recoverT = 0; // new target, reset recovery
+        stuckT = 0; recoverT = 0;
       }
 
-      const targetAngle = Math.atan2(dx, dz);
+      // Path lookahead target for smoother, anticipatory steering
+      const aim = lookaheadPoint(obs.x, obs.z, idx);
+      const ax = aim.x - obs.x, az = aim.z - obs.z;
+      const targetAngle = Math.atan2(ax, az);
       const err = normAngle(targetAngle - obs.heading);
-      const seekSteer = Math.max(-1, Math.min(1, err * 1.5));
-      const seekThrottle = dist < arrive * 1.2 ? 0.2 : 0.85 * Math.max(0.25, 1 - Math.abs(seekSteer) * 0.55);
+      const seekSteer = Math.max(-1, Math.min(1, err * 1.45));
 
-      const obstacles = (typeof getObstacles === "function" ? getObstacles() : ctx?.obstacles) || [];
-      const whiskers = senseWhiskers({ x: obs.x, z: obs.z, heading: obs.heading, obstacles, carRadius: 0.95 });
+      const obstacles = (typeof getObstacles === function ? getObstacles() : ctx?.obstacles) || [];
+      const whiskers = senseWhiskers({ x: obs.x, z: obs.z, heading: obs.heading, speed: obs.speed || 0, obstacles, carRadius: 0.95 });
       const avoid = avoidanceFromWhiskers(whiskers);
+
+      // Speed planning: slow for curvature + limited clearance + proximity to waypoint, accelerate when clear
+      const curvatureSlow = Math.max(0.3, 1 - Math.abs(seekSteer) * 0.5);
+      const clearanceSlow = avoid.clearAhead ? 1 : Math.max(0.2, 0.45 + (1 - avoid.urgency) * 0.55);
+      const approachSlow = dist < arrive * 2 ? 0.35 : dist < arrive * 4 ? 0.6 : 1;
+      let seekThrottle = 0.9 * curvatureSlow * clearanceSlow * approachSlow;
+      if (dist < arrive * 1.2) seekThrottle = Math.min(seekThrottle, 0.25);
 
       let steer = seekSteer;
       let throttle = seekThrottle;
-      if (avoid.urgency > 0.08) {
-        const w = Math.min(1, avoid.urgency * 1.35);
+      if (avoid.urgency > 0.06) {
+        const w = Math.min(1, avoid.urgency * 1.25);
         steer = seekSteer * (1 - w) + avoid.steer * w;
         throttle = Math.min(throttle, seekThrottle * avoid.throttleScale);
-        if (avoid.urgency > 0.9) throttle = Math.min(throttle, -0.2);
+        if (avoid.urgency > 0.9 && avoid.minClearance < 1.2) throttle = Math.min(throttle, -0.2);
       }
 
-      // Stuck detection: wants to move but making little progress / very slow while blocked
+      // Stuck detection & recovery
       const moved = lastX == null ? 1 : Math.hypot(obs.x - lastX, obs.z - lastZ);
       lastX = obs.x; lastZ = obs.z;
       if (moved > 0.003) progressT = 0; else progressT += dtObs;
@@ -92,8 +119,7 @@ export function createWaypointAgent({
       else stuckT = Math.max(0, stuckT - dtObs * 2);
 
       if (recoverT <= 0 && stuckT > 0.7) {
-        recoverT = 0.95 + Math.random() * 0.55; // reverse maneuver duration
-        // pick steer away from dominant whisker hit / avoidance bias
+        recoverT = 0.95 + Math.random() * 0.55;
         recoverSteer = avoid.steer !== 0 ? Math.sign(avoid.steer) : (err >= 0 ? -1 : 1);
         stuckT = 0;
       }
@@ -102,13 +128,12 @@ export function createWaypointAgent({
       if (recoverT > 0) {
         recoverT -= dtObs;
         recovering = true;
-        throttle = -0.85; // reverse
-        steer = recoverSteer * 0.95; // turn while reversing to get unstuck
-        // if clear behind-ish? keep it simple; timed recovery
+        throttle = -0.85;
+        steer = recoverSteer * 0.95;
       }
 
       const intent = clampIntent({ throttle, steer, brake: 0 });
-      Object.assign(debug, { idx, target: { x: tx, z: tz, dist: +dist.toFixed(2) }, waypoints, whiskers, avoid, seek: { steer: +seekSteer.toFixed(2), err: +err.toFixed(2) }, intent, obs: { x: obs.x, z: obs.z, heading: obs.heading, speed: obs.speed }, recovering, stuckT: +stuckT.toFixed(2) });
+      Object.assign(debug, { idx, target: { x: tx, z: tz, dist: +dist.toFixed(2) }, aim, waypoints, whiskers, avoid, seek: { steer: +seekSteer.toFixed(2), err: +err.toFixed(2) }, intent, obs: { x: obs.x, z: obs.z, heading: obs.heading, speed: obs.speed }, recovering, stuckT: +stuckT.toFixed(2) });
       return intent;
     },
     reset() { idx = 0; lastX = lastZ = null; progressT = stuckT = recoverT = 0; },

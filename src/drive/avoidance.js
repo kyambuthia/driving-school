@@ -1,4 +1,4 @@
-// 2D (XZ) helpers for simple obstacle avoidance. Forward = (sin(h), cos(h)).
+// 2D (XZ) helpers for obstacle avoidance. Forward = (sin(h), cos(h)).
 
 export function forwardVec(heading) {
   return { x: Math.sin(heading), z: Math.cos(heading) };
@@ -23,44 +23,77 @@ export function rayCircle(ox, oz, dx, dz, cx, cz, r, maxT) {
   return t;
 }
 
-export function senseWhiskers({ x, z, heading, obstacles = [], carRadius = 1.0, lengths = [5.5, 4.0, 4.0, 2.8, 2.8], angles = [0, 0.45, -0.45, 0.85, -0.85] }) {
+function obstacleAtTime(o, t) {
+  if (!o.dynamic) return { x: o.x, z: o.z, r: o.r || 1 };
+  const vx = o.vx || 0, vz = o.vz || 0;
+  // slight radius inflation for moving targets (uncertainty/margin)
+  return { x: o.x + vx * t, z: o.z + vz * t, r: (o.r || 1) + Math.min(0.35, Math.hypot(vx, vz) * 0.05) };
+}
+
+// Predictive whiskers: for dynamic obstacles, sample predicted positions over lookahead.
+export function senseWhiskers({ x, z, heading, obstacles = [], carRadius = 1.0, lengths = [6.5, 4.8, 4.8, 3.2, 3.2], angles = [0, 0.45, -0.45, 0.85, -0.85], speed = 0 } = {}) {
+  const lookahead = Math.max(0.4, Math.min(1.6, 0.5 + Math.abs(speed) * 0.12));
+  const samples = [0, lookahead * 0.35, lookahead * 0.7, lookahead];
   return angles.map((a, i) => {
     const h = heading + a;
     const dx = Math.sin(h), dz = Math.cos(h);
     const maxT = lengths[i] ?? lengths[0];
     let best = maxT;
     let hit = null;
+    let hitDynamic = false;
     for (const o of obstacles) {
-      const t = rayCircle(x, z, dx, dz, o.x, o.z, (o.r || 1) + carRadius, maxT);
-      if (t < best) { best = t; hit = o; }
+      if (o.dynamic) {
+        for (const st of samples) {
+          const p = obstacleAtTime(o, st);
+          // approximate: distance along ray vs time-to-reach — be conservative by checking predicted circle
+          const t = rayCircle(x, z, dx, dz, p.x, p.z, p.r + carRadius, maxT);
+          if (t < best) { best = t; hit = o; hitDynamic = true; }
+        }
+      } else {
+        const t = rayCircle(x, z, dx, dz, o.x, o.z, (o.r || 1) + carRadius, maxT);
+        if (t < best) { best = t; hit = o; hitDynamic = false; }
+      }
     }
-    return { angle: a, dir: { x: dx, z: dz }, maxT, t: best, hit: !!hit, obstacle: hit };
+    return { angle: a, dir: { x: dx, z: dz }, maxT, t: best, hit: !!hit, obstacle: hit, hitDynamic };
   });
 }
 
-// Returns steering bias (+right/-left in our sim convention?) and throttle scale based on whiskers.
+// Returns steering bias, throttle scale, and urgency based on whiskers.
+// Considers clearance and (predictive) closeness for speed planning.
 export function avoidanceFromWhiskers(whiskers) {
-  // whiskers order assumed: [center, left-ish? depends]. With our angles [0, +0.45, -0.45, ...]
-  // angle > 0 => heading + angle. Positive heading delta turns right in our sim? (heading += steer...)
-  // So angle +0.45 is a feeler to the right of forward.
   let steerBias = 0;
   let urgency = 0;
+  let minT = Infinity;
   for (const w of whiskers) {
     if (!Number.isFinite(w.t)) continue;
-    const closeness = 1 - w.t / w.maxT; // 1 = very close
+    minT = Math.min(minT, w.t);
+    const closeness = 1 - w.t / w.maxT;
     if (closeness <= 0) continue;
-    urgency = Math.max(urgency, closeness);
-    // If obstacle detected on a feeler angled to the right (+angle), steer left (-), and vice versa.
+    // weight dynamic/predictive hits slightly higher to encourage earlier yielding
+    const dynW = w.hitDynamic ? 1.15 : 1.0;
+    urgency = Math.max(urgency, closeness * dynW);
     const side = w.angle === 0 ? 0 : (w.angle > 0 ? -1 : 1);
-    const centerWeight = w.angle === 0 ? 1.2 : 1.0;
-    steerBias += side * closeness * centerWeight;
+    const centerWeight = w.angle === 0 ? 1.25 : 1.0;
+    steerBias += side * closeness * centerWeight * dynW;
   }
-  // If center is blocked, pick a side based on accumulated bias, default left.
   const center = whiskers[0];
   if (center && center.hit && Math.abs(steerBias) < 0.15) steerBias = -0.8;
+
+  // Speed planning from clearance: smoother, more anticipatory
+  let throttleScale = 1;
+  if (urgency > 0.9 || (center && center.hit && center.t < center.maxT * 0.25)) throttleScale = 0.1;
+  else if (urgency > 0.7) throttleScale = 0.3;
+  else if (urgency > 0.45) throttleScale = 0.55;
+  else if (urgency > 0.25) throttleScale = 0.75;
+  else if (urgency > 0.12) throttleScale = 0.9;
+
+  // if path ahead is very clear, allow full throttle (caller can still cap)
+  const clearAhead = !center?.hit && minT > 4.5;
   return {
     steer: Math.max(-1, Math.min(1, steerBias)),
-    throttleScale: urgency > 0.85 ? 0.15 : urgency > 0.55 ? 0.45 : urgency > 0.25 ? 0.75 : 1,
-    urgency,
+    throttleScale,
+    urgency: Math.min(1, urgency),
+    minClearance: Number.isFinite(minT) ? minT : Infinity,
+    clearAhead,
   };
 }

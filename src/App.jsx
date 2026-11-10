@@ -61,7 +61,11 @@ export default function App() {
   const agents = useMemo(() => {
     const getDynamic = (selfId) => {
       const out = [];
-      for (const [vid, v] of Object.entries(vehiclesRef.current)) if (vid !== selfId && v) out.push({ x: v.x, z: v.z, r: (v.r || 0.95) + 0.45 });
+      for (const [vid, v] of Object.entries(vehiclesRef.current)) {
+        if (vid === selfId || !v) continue;
+        const h = v.heading || 0, sp = v.speed || 0;
+        out.push({ x: v.x, z: v.z, r: (v.r || 0.95) + 0.45, vx: Math.sin(h) * sp, vz: Math.cos(h) * sp, dynamic: true, id: vid });
+      }
       return out;
     };
     const make = (id, wp) => createWaypointAgent({ id, loop: true, arrive: 1.8, waypoints: wp, getObstacles: () => getDynamic(id).concat(STATIC_OBSTACLES) });
@@ -75,7 +79,11 @@ export default function App() {
   const reportPose = (id, pose) => { vehiclesRef.current[id] = pose; };
   const getObstaclesFor = (id) => {
     const dyn = [];
-    for (const [vid, v] of Object.entries(vehiclesRef.current)) if (vid !== id && v) dyn.push({ x: v.x, z: v.z, r: (v.r || 0.95) + 0.45 });
+    for (const [vid, v] of Object.entries(vehiclesRef.current)) {
+      if (vid === id || !v) continue;
+      const h = v.heading || 0, sp = v.speed || 0;
+      dyn.push({ x: v.x, z: v.z, r: (v.r || 0.95) + 0.45, vx: Math.sin(h) * sp, vz: Math.cos(h) * sp, dynamic: true, id: vid });
+    }
     return dyn.concat(STATIC_OBSTACLES);
   };
 
